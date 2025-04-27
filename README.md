@@ -1,4 +1,29 @@
+tende_bundle (MODE=full ./tende_bundle.sh to run)
+coder@rudy:~/transfer-scripts$ MODE=full ./tende_bundle.sh
++ LOG_FILE=error.log
++ :
++ exec
+Your branch is up to date with 'origin/main'.
+[MODE: full] Processing gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__spacewire_uvc on branch main
+Your branch is up to date with 'origin/main'.
+Already up to date.
+[BUNDLE] Creating full bundle for gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__spacewire_uvc on main
+[WARNING] Branch staging not found in gm-tma/tenants/gmz/omd/swa/swa_firmware/fw-uvcs/spacewire_uvc
+Fetching origin
+Your branch and 'origin/main' have diverged,
+and have 3 and 10 different commits each, respectively.
+  (use "git pull" to merge the remote branch into yours)
+[MODE: full] Processing gm-tma__infrastructure__coder-templates__questa-vnc on branch main
+Your branch and 'origin/main' have diverged,
+and have 3 and 10 different commits each, respectively.
+  (use "git pull" to merge the remote branch into yours)
+
+----------------------------------------------------------------------------------------------------------------------------------------
+
 #!/usr/bin/env bash
+
+GITLAB_TOKEN="d9z9AcayqfEsGe5sv9RG"
+
 set -euxo pipefail
 
 LOG_FILE="error.log"
@@ -153,320 +178,471 @@ main() {
 main
 
 
+-----------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env bash
 
+GITLAB_TOKEN="d9z9AcayqfEsGe5sv9RG"
 
-
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-#!/usr/bin/bash
+set -euxo pipefail
 
 LOG_FILE="error.log"
-
-# Truncate the log file at the start of the script
-true > "$LOG_FILE"
-
-# Redirect stderr for the entire script
-exec 2>> "$LOG_FILE"
-
-# Redirect stdout to both the terminal and log file
+: >"$LOG_FILE"
+exec 2>>"$LOG_FILE"
 exec > >(tee -a "$LOG_FILE")
 
-
-# Check if the GitLab access token is set in the environment, exit if not
-if [ -z "$GITLAB_TOKEN" ]; then
-  echo "Error: GITLAB_TOKEN environment variable is not set." >&2
-  echo "Please set your GitLab token using: export GITLAB_TOKEN='your_personal_access_token'" >&2
+# Validate GitLab token
+if [[ -z "${TF_VAR_gitlab_token:-}" && -z "${GITLAB_TOKEN:-}" ]]; then
+  echo "Error: GitLab token not set." >&2
   exit 1
 fi
 
-# Set the current working directory
+# MODE toggle: 'full' or 'incremental'
+MODE="${MODE:-incremental}"
+
+GITLAB_TOKEN="${TF_VAR_gitlab_token:-$GITLAB_TOKEN}"
+GITLAB_URL="${GITLAB_URL:-https://gitlab.mda.mil}"
+GROUP_ID="${GROUP_ID:-3482}"
+
 CWD=$(pwd)
+BUNDLE_DIR="${BUNDLE_DIR:-$CWD/gitlab_repos_bundles}"
+LOCAL_REPO_BASE="${LOCAL_REPO_BASE:-$CWD/local_gitlab_repos}"
+BUNDLE_BRANCHES="${BUNDLE_BRANCHES:-main staging}"
+TAG_SUFFIX="transfer"
 
-#GITLAB_TOKEN="$TF_VAR_gitlab_token"
-#GITLAB_TOKEN="d9z9AcayqfEsGe5sv9RG"
+IFS=' ' read -r -a BUNDLE_BRANCHES_ARRAY <<< "$BUNDLE_BRANCHES"
+mkdir -p "$BUNDLE_DIR" "$LOCAL_REPO_BASE"
 
-# Base GitLab URL (destination GitLab, airgapped environment)
-DEST_GITLAB_URL="${DEST_GITLAB_URL:-"https://gitlab.mda.mil"}"
-
-# Directory where the bundles are located
-BUNDLE_DIR="${BUNDLE_DIR:-"${CWD}/gitlab_repos_bundles"}"
-
-# Directory where local repositories will be stored
-LOCAL_REPO_BASE="${LOCAL_REPO_BASE:-"${CWD}/local_gitlab_repos"}"
-
-# Get today's date for branch prefix (YYYYMMDD)
-TODAY=$(date +%Y%m%d)
-BRANCH_PREFIX="transfer-${TODAY}/"
-
-# Create the directory for local repositories
-mkdir -p "$LOCAL_REPO_BASE"
-
-# Declare an associative array to hold ignored files for repository groups
-#declare -A ignored_files
-#declare -A ignored_subgroups
-
-# Example: Set ignored files/patterns for individual or multiple repositories
-#ignored_files["repo1"]="*.log *.tmp"
-#ignored_files["repo2,repo5,repo8"]="README.md config.json *.bak"
-#ignored_files["repo3,repo12"]="docs/*"
-
-# Common ignored files for all repositories
-#common_ignored="*.swp .gitignore"
-
-# Example: Set ignored files/patterns for subgroups by subgroup ID or namespace
-#ignored_subgroups["123324"]="**/providers.tf"
-#ignored_subgroups["my-top-level-group/infrastructure-group/terraform-subgroup"]="**/providers.tf"
-
-# Function to get the ignored files for a repository or subgroup
-get_ignored_files() {
-    local repo_name=$1
-    local repo_namespace=$2
-    local subgroup_id=$3
-
-    # Check if there are any specific ignored files for the repository
-    for repo_group in "${!ignored_files[@]}"; do
-        if [[ ",${repo_group}," == *",$repo_name,"* ]]; then
-            echo "${ignored_files[$repo_group]} $common_ignored"
-            return
-        fi
-    done
-
-    # Check if there are any specific ignored files for the subgroup by ID or namespace
-    if [ -n "${ignored_subgroups[$subgroup_id]}" ]; then
-        echo "${ignored_subgroups[$subgroup_id]} $common_ignored"
-        return
-    fi
-    if [ -n "${ignored_subgroups[$repo_namespace]}" ]; then
-        echo "${ignored_subgroups[$repo_namespace]} $common_ignored"
-        return
-    fi
-
-    # Return only common ignored files if no specific exclusions were found
-    echo "$common_ignored"
+get_projects_in_group() {
+  curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    "$GITLAB_URL/api/v4/groups/$GROUP_ID/projects?include_subgroups=true&per_page=100" |
+    jq -r '.[] | "\(.id);\(.path_with_namespace)"'
 }
 
-# Function to URL-encode a string
-urlencode() {
-    local string="$1"
-    local strlen=${#string}
-    local encoded=""
-
-    for (( pos=0 ; pos<strlen ; pos++ )); do
-        c=${string:$pos:1}
-        case "$c" in
-            [a-zA-Z0-9.~_-]) encoded+="$c" ;;
-            *) encoded+=$(printf '%%%02X' "'$c") ;;
-        esac
-    done
-    echo "$encoded"
+get_repo_https_url() {
+  local repo_id=$1
+  curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$GITLAB_URL/api/v4/projects/$repo_id" |
+    jq -r '.http_url_to_repo'
 }
 
-# Function to create a branch in the destination GitLab if it doesn't exist
-create_branch_if_missing() {
-    local project_id=$1
-    local branch_name=$2
-    local ref=$3  # Reference (usually 'main' or 'master')
+get_latest_commit() {
+  git rev-parse HEAD
+}
 
-    # Check if the branch exists in the destination GitLab
-    branch_exists=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        "$DEST_GITLAB_URL/api/v4/projects/$project_id/repository/branches/$(urlencode "$branch_name")" | jq -r '.name')
+get_root_commit() {
+  git rev-list --max-parents=0 HEAD | tail -n 1
+}
 
-    # If the branch does not exist, create it
-    if [ "$branch_exists" == "null" ]; then
-        echo "Branch $branch_name does not exist. Creating it from $ref..." >&2
-        curl --silent --request POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-            "$DEST_GITLAB_URL/api/v4/projects/$project_id/repository/branches" \
-            --data-urlencode "branch=$branch_name" \
-            --data-urlencode "ref=$ref" > /dev/null
-        echo "Branch $branch_name created." >&2
+get_last_commit_file() {
+  local sanitized=$1
+  local branch=$2
+  echo "$BUNDLE_DIR/last_commit__${sanitized}__${branch}"
+}
+
+create_bundle() {
+  local repo_path=$1
+  local branch=$2
+  local bundle_file=$3
+  local sanitized=$4
+
+  echo "[MODE: $MODE] Processing $sanitized on branch $branch"
+
+  cd "$repo_path"
+  git checkout "$branch" || git checkout -b "$branch" "origin/$branch"
+  git pull origin "$branch"
+
+  local latest_commit
+  latest_commit=$(get_latest_commit)
+
+  local last_commit_file
+  last_commit_file=$(get_last_commit_file "$sanitized" "$branch")
+
+  local last_commit=""
+  if [[ -f "$last_commit_file" ]]; then
+    last_commit=$(cat "$last_commit_file")
+    if ! git cat-file -e "$last_commit" 2>/dev/null; then
+      last_commit=$(get_root_commit)
+    fi
+  else
+    last_commit=$(get_root_commit)
+  fi
+
+  if [[ "$MODE" == "incremental" ]]; then
+    if [[ "$latest_commit" == "$last_commit" ]]; then
+      echo "[SKIPPED] No new commits for $sanitized on $branch"
+      cd - >/dev/null
+      return 0
+    fi
+
+    local tag="v$(date +%Y%m%d%H%M%S)-$TAG_SUFFIX"
+    echo "[TAG] Creating transfer tag: $tag at $latest_commit"
+    git tag -a "$tag" "$latest_commit" -m "Transfer tag $tag"
+    git bundle create "$bundle_file" "$last_commit..$latest_commit"
+    echo "$latest_commit" > "$last_commit_file"
+    echo "[BUNDLE] Incremental bundle created at $bundle_file"
+  else
+    echo "[BUNDLE] Creating full bundle for $sanitized on $branch"
+    git bundle create "$bundle_file" --all
+    echo "$latest_commit" > "$last_commit_file"
+  fi
+
+  cd - >/dev/null
+}
+
+process_repo() {
+  local repo_id=$1
+  local repo_namespace=$2
+
+  repo_url=$(get_repo_https_url "$repo_id")
+  sanitized_name=$(echo "$repo_namespace" | sed 's|/|__|g')
+  local_path="$LOCAL_REPO_BASE/$sanitized_name"
+
+  if [[ -d "$local_path/.git" ]]; then
+    git -C "$local_path" fetch --all --tags
+  else
+    git clone "$repo_url" "$local_path"
+  fi
+
+  for branch in "${BUNDLE_BRANCHES_ARRAY[@]}"; do
+    if git -C "$local_path" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      git -C "$local_path" checkout "$branch" || git -C "$local_path" checkout -b "$branch" "origin/$branch"
+      bundle_path="$BUNDLE_DIR/${sanitized_name}__${branch}.bundle"
+      create_bundle "$local_path" "$branch" "$bundle_path" "$sanitized_name"
     else
-        echo "Branch $branch_name already exists." >&2
+      echo "[WARNING] Branch $branch not found in $repo_namespace"
     fi
+  done
 }
 
-# Function to submit a merge request
-submit_merge_request() {
-    local project_id=$1
-    local source_branch=$2
-    local target_branch=$3
-    local repo_name=$4
+main() {
+  REPOSITORIES=$(get_projects_in_group)
+  if [[ -z "$REPOSITORIES" ]]; then
+    echo "No repositories found."
+    exit 1
+  fi
 
-    echo "Submitting merge request from $source_branch to $target_branch for project $repo_name..." >&2
+  echo "$REPOSITORIES" | while IFS=';' read -r repo_id repo_namespace; do
+    [[ -z "$repo_id" ]] && continue
+    process_repo "$repo_id" "$repo_namespace"
+  done
 
-    # Submit the merge request
-    curl --silent --request POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        "$DEST_GITLAB_URL/api/v4/projects/$project_id/merge_requests" \
-        --data-urlencode "source_branch=$source_branch" \
-        --data-urlencode "target_branch=$target_branch" \
-        --data-urlencode "title=Merge from $source_branch into $target_branch" \
-        --data-urlencode "description=Automated merge request for repository $repo_name" \
-        --data "remove_source_branch=true" > /dev/null
-
-    echo "Merge request submitted from $source_branch to $target_branch." >&2
+  echo "------- Summary of Bundles --------"
+  if ls -1 "$BUNDLE_DIR"/*.bundle 2>/dev/null; then
+    echo "Bundles created:"
+    ls -l "$BUNDLE_DIR"/*.bundle
+  else
+    echo "No bundles were created."
+  fi
 }
 
-# Function to get the namespace ID on the destination GitLab
-get_namespace_id() {
-    local namespace_path=$1
+main
 
-    # If the namespace is empty or root, return null
-    if [ -z "$namespace_path" ] || [ "$namespace_path" == "." ]; then
-        echo "null"
-        return
-    fi
+--------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------
 
-    namespace=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        "$DEST_GITLAB_URL/api/v4/namespaces?search=$(urlencode "$namespace_path")" | jq -r '.[] | select(.full_path=="'"$namespace_path"'")')
 
-    namespace_id=$(echo "$namespace" | jq -r '.id')
 
-    if [ -z "$namespace_id" ] || [ "$namespace_id" == "null" ]; then
-        echo "Namespace $namespace_path does not exist. Creating it..." >&2
 
-        # Create the namespace (group)
-        namespace=$(curl --silent --request POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-            "$DEST_GITLAB_URL/api/v4/groups" \
-            --data-urlencode "name=$(basename "$namespace_path")" \
-            --data-urlencode "path=$(basename "$namespace_path")" \
-            --data-urlencode "parent_id=$(get_namespace_id "$(dirname "$namespace_path")")" \
-            --data "visibility=private")
 
-        namespace_id=$(echo "$namespace" | jq -r '.id')
 
-        if [ -z "$namespace_id" ] || [ "$namespace_id" == "null" ]; then
-            echo "Error: Could not create namespace $namespace_path." >&2
-            echo "Check your permissions." >&2
-            exit 1
-        fi
-    fi
 
-    echo "$namespace_id"
-}
 
-# Function to push repository branches to "transfer-YYYYMMDD/<branch>" on the destination GitLab
-push_to_transfer_branch() {
-    local repo_namespace=$1
-    local branch=$2
 
-    echo "Processing repository: $repo_namespace" >&2
 
-    # Replace slashes in repo namespace with double underscores
-    local sanitized_repo_namespace=$(echo "$repo_namespace" | sed 's/\//__/g')
 
-    # Define local repository path
-    local local_repo_path="$LOCAL_REPO_BASE/$sanitized_repo_namespace"
-
-    # Change to the repository directory
-    cd "$local_repo_path" || { echo "Repository $repo_namespace not found locally." >&2; return; }
-
-    # Fetch subgroup ID (assuming it's stored in a metadata file or via API)
-    subgroup_id=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        "$DEST_GITLAB_URL/api/v4/projects/$(urlencode "$repo_namespace")" | jq -r '.namespace.id')
-
-    # Get the list of ignored files/patterns for the current repository or subgroup
-    ignored_patterns=$(get_ignored_files "$repo_namespace" "$repo_namespace" "$subgroup_id")
-
-    echo "Ignoring the following files in $repo_namespace: $ignored_patterns" >&2
-
-    # Mark the ignored files as skipped for staging
-    for pattern in $ignored_patterns; do
-        git update-index --assume-unchanged "$pattern" 2>/dev/null
-    done
-
-    # Set the destination GitLab repository URL
-    dest_repo_url="$DEST_GITLAB_URL/$repo_namespace.git"
-
-    # Ensure the repository exists on the destination GitLab
-    project=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        "$DEST_GITLAB_URL/api/v4/projects/$(urlencode "$repo_namespace")")
-    project_id=$(echo "$project" | jq -r '.id')
-
-    if [ "$project_id" == "null" ] || [ -z "$project_id" ]; then
-        echo "Project $repo_namespace does not exist on the destination GitLab. Creating it..." >&2
-
-        # Create the project (assuming you have permissions to do so)
-        project=$(curl --silent --request POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-            "$DEST_GITLAB_URL/api/v4/projects" \
-            --data-urlencode "name=$(basename "$repo_namespace")" \
-            --data-urlencode "path=$(basename "$repo_namespace")" \
-            --data-urlencode "namespace_id=$(get_namespace_id "$(dirname "$repo_namespace")")" \
-            --data "visibility=private")
-        project_id=$(echo "$project" | jq -r '.id')
-
-        if [ "$project_id" == "null" ] || [ -z "$project_id" ]; then
-            echo "Error: Could not create project $repo_namespace on the destination GitLab." >&2
-            return
-        fi
-
-        echo "Project $repo_namespace created with ID $project_id." >&2
-    else
-        echo "Project $repo_namespace exists with ID $project_id." >&2
-    fi
-
-    # Set the remote URL to the destination GitLab
-    git remote rm origin >/dev/null 2>&1
-    git remote add origin "$dest_repo_url"
-
-    # Push the branch to the destination GitLab under the transfer prefix
-    transfer_branch="${BRANCH_PREFIX}${branch}"
-    echo "Pushing branch $branch to $transfer_branch on destination GitLab..." >&2
-    git push origin "$branch:$transfer_branch"
-
-    # Create the target branch in the destination if it doesn't exist
-    create_branch_if_missing "$project_id" "$branch" "$transfer_branch"
-
-    # Submit the merge request from transfer-YYYYMMDD/<branch> to the original <branch>
-    submit_merge_request "$project_id" "$transfer_branch" "$branch" "$repo_namespace"
-
-    # Return to the main directory
-    cd - >/dev/null || exit 1
-}
-
-# Loop through all .bundle files and process each repository
-for bundle_file in "$BUNDLE_DIR"/*.bundle; do
-    # Extract repository namespace and branch from the bundle filename
-    filename=$(basename "$bundle_file")
-    repo_info=$(echo "$filename" | sed 's/__/\//g' | sed 's/\.bundle$//')
-    repo_namespace=$(echo "$repo_info" | cut -d'__' -f1)
-    branch=$(echo "$repo_info" | cut -d'__' -f2)
-
-    # Replace double underscores with slashes to get the original namespace, Replace any leading slashes, Replace any multiple slashes with single slash, Replace any trailing slashes
-    repo_namespace=$(echo "$repo_namespace" | sed -e 's/__/\/\//g' -e 's#^/##' -e 's#//*#/#g' -e 's#/$##')
-
-    # Define local repository path
-    sanitized_repo_namespace=$(echo "$repo_namespace" | sed 's/\//__/g')
-    local_repo_path="$LOCAL_REPO_BASE/$sanitized_repo_namespace"
-
-    # Initialize or update the repository
-    if [ -d "$local_repo_path/.git" ]; then
-        echo "Repository $repo_namespace exists locally. Fetching bundle..." >&2
-        cd "$local_repo_path" || exit 1
-        if ! git fetch "$bundle_file"; then
-            echo "Error: Failed to fetch bundle for $repo_namespace" >&2
-            continue
-        fi
-    else
-        echo "Initializing repository $repo_namespace..." >&2
-        mkdir -p "$local_repo_path"
-        cd "$local_repo_path" || exit 1
-        git init
-        if ! git fetch "$bundle_file"; then
-            echo "Error: Failed to fetch bundle for $repo_namespace" >&2
-            continue
-        fi
-    fi
-
-    # Update the branch
-    if ! git checkout -B "$branch" "FETCH_HEAD"; then
-        echo "Error: Failed to update branch $branch for $repo_namespace" >&2
-        cd - >/dev/null || exit 1
-        continue
-    fi
-
-    # Push to the destination GitLab and submit merge request
-    push_to_transfer_branch "$repo_namespace" "$branch"
-
-    # Return to the main directory
-    cd - >/dev/null || exit 1
-done
-
-echo "All repositories have been processed and pushed to the destination GitLab." >&2
+coder@rudy:~/transfer-scripts$ ./tende-airgap.sh 
+[INFO] Starting GitLab Airgap Bundle Import Process
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__coder-support__coder-blob-storage__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__coder-support__coder-blob-storage__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__coder-templates__coder-templates-security-policy-project__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__coder-templates__coder-templates-security-policy-project__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__coder-templates__coder-templates-security-policy-project-security-policy-project__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__coder-templates__coder-templates-security-policy-project-security-policy-project__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__coder-templates__kubernetes-custom-security-policy-project__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__coder-templates__kubernetes-custom-security-policy-project__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__containers__code-marketplace__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__containers__code-marketplace__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__pipelines__azure-vm-pipeline__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__pipelines__azure-vm-pipeline__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__pipelines__vscode-extensions-pipeline__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__pipelines__vscode-extensions-pipeline__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__project-templates__coder-project-template__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__project-templates__coder-project-template__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__renovate-runner__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__renovate-runner__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__scripts__mcr-inspector__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__scripts__mcr-inspector__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__scripts__runner-check__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__scripts__runner-check__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__scripts__windows-scripts__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__scripts__windows-scripts__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__aks_log_analytics__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__aks_log_analytics__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__aks__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__aks__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__avd__avd_core__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__avd__avd_core__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__avd__avd_session_hosts__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__avd__avd_session_hosts__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__key_vault__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__key_vault__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__log_analytics__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__log_analytics__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__node_pool__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__node_pool__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__postgres__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__postgres__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__storage_account__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__storage_account__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__virtual_network__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__virtual_network__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__infrastructure__terraform__terraform-modules__azure-custom__vm__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__infrastructure__terraform__terraform-modules__azure-custom__vm__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__ana__requests__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__ana__requests__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__de__requests__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__de__requests__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__ied__requests__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__ied__requests__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__mns__requests__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__mns__requests__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__requests__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__requests__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__findings_app__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__findings_app__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__runner_sandbox__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__runner_sandbox__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__svuml__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__svuml__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__uvm_error_binning__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__uvm_error_binning__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__uvm_error_parse__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-automation__uvm_error_parse__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__gws_dashking__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__gws_dashking__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__ivv_gem_modem_uml__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__ivv_gem_modem_uml__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_fpga-5NdtR__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_fpga-5NdtR__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_tb.dsc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_tb.dsc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_tb-nueQI__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-gmn-gws__rxtx_tb-nueQI__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__cic__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__cic__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__gem_ublaze_microproc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__gem_ublaze_microproc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad5666__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad5666__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7655__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7655__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7691__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7691__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7923__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7923__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7949__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7949__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7980__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad7980__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad9253__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad9253__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad9786__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ad9786__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_adf411x__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_adf411x__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ads8326__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ads8326__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_at28lv010_uvc-F2l5n__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_at28lv010_uvc-F2l5n__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_at28lv_eeprom__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_at28lv_eeprom__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_avalon__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_avalon__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_cad_l3h__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_cad_l3h__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ds1626__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ds1626__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_gige_temac_example__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_gige_temac_example__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1019a_uvc-nYXwz__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1019a_uvc-nYXwz__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1112_uvc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1112_uvc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1112_uvc-oDOlt__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_hmc1112_uvc-oDOlt__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ina226_uvc-5S1gp__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ina226_uvc-5S1gp__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_lm83_uvc-ILqby__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_lm83_uvc-ILqby__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max106__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max106__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max1237_uvc-AlZbF__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max1237_uvc-AlZbF__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max531__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_max531__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_pci__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_pci__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_pnor_flash__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_pnor_flash__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_quick_eth_uvc-QUeQ3__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_quick_eth_uvc-QUeQ3__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_sdlc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_sdlc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_serpnor__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_serpnor__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_spi__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_spi__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__codec__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__codec__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__sfpd__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__sfpd__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__srio__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__srio__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__srio_over_sfpdp__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_srio_bundle__srio_over_sfpdp__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_stft__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_stft__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tlv2556__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tlv2556__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tlv5638__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tlv5638__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tmp422__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tmp422__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tmp461__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tmp461__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tms320c67xx__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_tms320c67xx__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_uart__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_uart__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ublazefsl__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ublazefsl__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ublaze_uvc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_ublaze_uvc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_wishbone__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__ivv_wishbone__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qddrx__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qddrx__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qeth_uvc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qeth_uvc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qpcie__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__qpcie__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__spacewire_uvc__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-uvcs__spacewire_uvc__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__diamond__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__diamond__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__ise__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__ise__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__ivv_uvm-KycfX__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__ivv_uvm-KycfX__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__libero__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__libero__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__qformal_xilinx-SJyvL__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__qformal_xilinx-SJyvL__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__quartus__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__quartus__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__vivado-l7h0x__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__vivado-l7h0x__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__vsi_api-jDWEi__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__fw-vendors__vsi_api-jDWEi__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__swa__swa_firmware__questa_job_mgr__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__swa__swa_firmware__questa_job_mgr__main.bundle. Skipping.
+Reinitialized existing Git repository in /home/coder/transfer-scripts/imported_gitlab_repos/https:____gitlab.mda.mil__gm-tma__transfer-script-test-group__transfer-script-test-group.git/.git/
+[INFO] Attempting to fetch bundle: gm-tma__tenants__gmz__omd__tma__tma-issue-project__main.bundle
+[ERROR] Failed to fetch from bundle gm-tma__tenants__gmz__omd__tma__tma-issue-project__main.bundle. Skipping.
